@@ -1,0 +1,183 @@
+import tensorflow as tf
+import tensorflow_addons as tfa
+import gym
+import gym_anytrading
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from finta import TA
+from tf_agents.environments.tf_py_environment import TFPyEnvironment
+from tf_agents.agents import DqnAgent
+from tf_agents.networks import q_network
+from tf_agents.specs import tensor_spec
+from tf_agents.trajectories import trajectory
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.utils import common
+
+df = pd.read_csv('/BNBUSDTKlines2.csv')
+df = df.iloc[:, :-1]
+df.set_index('Date', inplace=True)
+df.index = pd.to_datetime(df.index, unit='ms')
+df['SMA'] = TA.SMA(df, 12)
+df['RSI'] = TA.RSI(df)
+df['OBV'] = TA.OBV(df)
+df.fillna(0, inplace=True)
+
+
+
+def add_signals(env):
+    start = env.frame_bound[0] - env.window_size
+    end = env.frame_bound[1]
+    prices = env.df.loc[:, 'Low'].to_numpy()[start:end]
+    signal_features = env.df.loc[:, ['Low', 'Volume','SMA', 'RSI', 'OBV']].to_numpy()[start:end]
+    return prices, signal_features
+
+from tf_agents.environments.py_environment import PyEnvironment
+
+class MyCustomEnv(PyEnvironment):
+    def __init__(self, df, window_size, frame_bound):
+        self.window_size = window_size
+        self.frame_bound = frame_bound
+        self.df = df
+        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.window_size, 5), dtype=np.float32) #здесь
+        self.prices, self.signal_features = add_signals(self)
+        self._action_spec = tensor_spec.BoundedTensorSpec(
+            shape=(), dtype=tf.int32, minimum=0, maximum=2, name='action')
+        self._observation_spec = tensor_spec.BoundedTensorSpec(
+            shape=(self.window_size, 5), dtype=tf.float64, minimum=0, maximum=1, name='observation') #здесь
+        self._state = None
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        self._state = self.window_size
+        obs = self._next_observation()
+        return ts.restart(obs)
+
+    def _step(self, action):
+        self._state += 1
+        reward = self._take_action(action)
+        done = self._state >= self.frame_bound[1]
+        if done:
+            return ts.termination(self._next_observation(), reward)
+        else:
+            obs = self._next_observation()
+            return ts.transition(obs, reward=reward)
+
+    def _next_observation(self):
+        window = self._state - self.window_size
+        obs = self.signal_features[window:self._state]
+        return obs
+
+    def _take_action(self, action):
+        action_type = action
+        amount = 1
+        current_price = self.prices[self._state]
+        if action_type == 0:
+            amount = 0
+        elif action_type == 1:
+            amount = 1
+        elif action_type == 2:
+            amount = 2
+        else:
+            raise ValueError(f"Invalid action type {action_type}")
+        action_reward = current_price * amount
+        return action_reward
+
+# Определим гиперпараметры обучения
+num_iterations = 20000  # Количество итераций обучения
+initial_collect_steps = 1000  # Количество шагов для заполнения буфера в начале обучения
+collect_steps_per_iteration = 1  # Количество шагов для добавления в буфер на каждой итерации
+replay_buffer_max_length = 100000  # Максимальная длина буфера воспроизведения
+batch_size = 64  # Размер пакета для обучения
+learning_rate = 1e-3  # Скорость обучения
+
+# Создаем агента и определяем collect_data_spec
+q_net = q_network.QNetwork(
+    tf_env.observation_spec(),
+    tf_env.action_spec(),
+    fc_layer_params=(100,)
+)
+agent = DqnAgent(
+    tf_env.time_step_spec(),
+    tf_env.action_spec(),
+    q_network=q_net,
+    optimizer=tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate),
+    td_errors_loss_fn=common.element_wise_squared_loss,
+    train_step_counter=tf.compat.v2.Variable(0)
+)
+agent.initialize()
+
+
+# Определим буфер воспроизведения и заполним его начальными данными
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+    data_spec=agent.collect_data_spec,
+    batch_size=tf_env.batch_size,
+    max_length=replay_buffer_max_length
+)
+
+
+# Функция для сбора опыта
+def collect_experience(env, agent, buffer, steps):
+    for _ in range(steps):
+        time_step = env.current_time_step()
+        action_step = agent.policy.action(time_step)
+        next_time_step = env.step(action_step.action)
+        traj = trajectory.from_transition(time_step, action_step, next_time_step)
+        traj = traj._replace(observation=tf.cast(traj.observation, tf.float32))  # изменение здесь
+        buffer.add_batch(traj)
+
+
+# Начальное заполнение буфера воспроизведения
+collect_experience(tf_env, agent, replay_buffer, initial_collect_steps)
+
+# Определим функцию для обучения агента
+dataset = replay_buffer.as_dataset(
+    num_parallel_calls=3,
+    sample_batch_size=batch_size,
+    num_steps=2
+).prefetch(3)
+
+iterator = iter(dataset)
+
+# Определим оптимизатор
+optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate)
+
+# Функция для обучения агента
+def agent_update():
+    experience, _ = next(iterator)
+    return agent.train(experience)
+
+# Запустим цикл обучения агента
+agent.train = common.function(agent.train)
+
+for i in range(num_iterations):
+    agent_update()
+    if i % 1000 == 0:
+        print('iteration: {}, loss: {}'.format(i, agent.train.get().loss))
+
+# Посмотрим, как наш агент торгует на окне 50-62
+env = MyCustomEnv(df=df, window_size=12, frame_bound=(50,62))
+tf_env = TFPyEnvironment(env)
+
+obs = tf_env.reset()
+while not tf_env.current_time_step().is_last():
+    action = agent.policy.action(obs)
+    obs = tf_env.step(action.action)
+
+# Отобразим график торговли
+df_subset = df.iloc[50:62]
+low = df_subset['Low'].to_numpy()
+high = df_subset['High'].to_numpy()
+plt.plot(np.arange(0,12), low[:12])
+plt.plot(np.arange(0,12), high[:12])
+plt.plot(np.arange(12,13), low[12:], label='actual')
+plt.plot(np.arange(12,13), high[12:], label='actual')
+plt.plot(np.arange(12,13), obs.observation[0,:,0], label='predicted')
+plt.legend()
+plt.show()
