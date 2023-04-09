@@ -1,0 +1,267 @@
+import tensorflow as tf
+import tensorflow_addons as tfa
+import gym
+import gym_anytrading
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+from finta import TA
+from tf_agents.environments.tf_py_environment import TFPyEnvironment
+from tf_agents.agents import DqnAgent
+from tf_agents.networks import QNetwork
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.specs import tensor_spec
+from tf_agents.trajectories import time_step as ts
+from tf_agents.utils import common
+
+
+class MyCustomEnv(tf_agents.environments.py_environment.PyEnvironment):
+    def __init__(self, df, window_size, frame_bound):
+        super().__init__()
+        self.window_size = window_size
+        self.frame_bound = frame_bound
+        self.df = df
+        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(self.window_size, 5), dtype=np.float32)
+        self.prices, self.signal_features = add_signals(self)
+        self._action_spec = tensor_spec.BoundedTensorSpec(
+            shape=(), dtype=tf.int32, minimum=0, maximum=2, name='action')
+        self._observation_spec = tensor_spec.BoundedTensorSpec(
+            shape=(self.window_size, 5), dtype=tf.float32, minimum=0, maximum=1, name='observation')
+        self._state = None
+
+    def action_spec(self):
+        return self._action_spec
+
+    def observation_spec(self):
+        return self._observation_spec
+
+    def _reset(self):
+        self._state = self.window_size
+        obs = self._next_observation()
+        return ts.restart(obs)
+
+    def _step(self, action):
+        self._state += 1
+        reward = self._take_action(action)
+        done = self._state >= self.frame_bound[1]
+        if done:
+            return ts.termination(self._next_observation(), reward)
+        else:
+            obs = self._next_observation()
+            return ts.transition(obs, reward=reward)
+
+    def _next_observation(self):
+        window = self._state - self.window_size
+        obs = self.signal_features[window:self._state]
+        return obs
+
+    def _take_action(self, action):
+        action_type = action
+        amount = 1
+        current_price = self.prices[self._state]
+        if action_type == 0:
+            amount = 0
+        elif action_type == 1:
+            amount = 1
+        elif action_type == 2:
+            amount = 2
+        else:
+            raise ValueError(f"Invalid action type {action_type}")
+        action_reward = current_price * amount
+        return action_reward
+
+
+# Определим гиперпараметры обучения
+num_iterations = 200000  # Количество итераций обучения
+initial_collect_steps = 100  # Количество шагов для заполнения буфера в начале обучения
+collect_steps_per_iteration = 1  # Количество шагов для добавления в буфер на каждой итерации
+replay_buffer_max_length = 100000  # Максимальная длина буфера воспроизведения
+
+Определим оптимизатор и функцию потерь
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+mse_loss_fn = tf.keras.losses.MeanSquaredError()
+
+Создадим буфер воспроизведения
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+data_spec=agent.collect_data_spec,
+batch_size=train_env.batch_size,
+max_length=replay_buffer_max_length)
+
+Создадим цикл обучения
+dataset = replay_buffer.as_dataset(
+num_parallel_calls=3,
+sample_batch_size=batch_size,
+num_steps=2).prefetch(3)
+
+iterator = iter(dataset)
+
+Определим метрику для отслеживания средней награды
+average_reward = tf.keras.metrics.Mean(name='average_reward')
+
+Определим функцию для обучения агента
+@tf.function
+def train_agent():
+experience, unused_info = next(iterator)
+loss = tf.constant(0.0)
+with tf.GradientTape() as tape:
+for i in range(num_iterations):
+# Получаем действие от агента на основе состояния
+action_step = agent.policy_step(experience)
+# Применяем действие к среде и получаем следующее состояние и награду
+next_state_step = train_env.step(action_step.action)
+reward = next_state_step.reward
+# Добавляем переход в буфер воспроизведения
+replay_buffer.add_batch(experience)
+# Получаем мини-батч из буфера воспроизведения
+experience, unused_info = next(iterator)
+# Вычисляем целевое значение Q-функции
+target_q_values = agent.target_q_network(
+next_state_step.observation).q_values
+max_q_value = tf.reduce_max(target_q_values, axis=-1)
+target_q_values = reward + gamma * max_q_value
+# Получаем оценку Q-функции от сети
+q_values = agent.q_network(experience.observation).q_values
+actions = experience.action
+# Вычисляем значение функции потерь
+loss += mse_loss_fn(target_q_values, q_values)
+# Обновляем сеть
+grads = tape.gradient(loss, agent.q_network.trainable_variables)
+optimizer.apply_gradients(
+zip(grads, agent.q_network.trainable_variables))
+# Обновляем метрику
+average_reward(reward)
+# Выводим информацию о ходе обучения каждые 100 итераций
+if i % 100 == 0:
+print('Iteration: {0} Loss: {1:.3f} Average Reward: {2:.3f}'.format(
+i, loss / collect_steps_per_iteration, average_reward.result()))
+average_reward.reset_states()
+Определим гиперпараметры обучения
+num_iterations = 200000 # Количество итераций обучения
+initial_collect_steps = 100 # Количество шагов для заполнения буфера в начале обучения
+collect_steps_per_iteration = 1 # Количество шагов для добавления в буфер на каждой итерации
+replay_buffer_max_length = 100000 # Максимальная длина буфера воспроизведения
+
+Определим оптимизатор и функцию потерь
+optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=1e-3)
+loss_function = tf.keras.losses.MeanSquaredError()
+
+Создадим объекты для окружения и агента
+environment = tf_py_environment.TFPyEnvironment(suite_gym.load('CartPole-v0'))
+agent = DqnAgent(environment.time_step_spec(), environment.action_spec(), q_network=q_net, optimizer=optimizer, td_errors_loss_fn=loss_function)
+
+Создадим объекты для сохранения и загрузки модели
+train_checkpointer = common.Checkpointer(ckpt_dir='cartpole_checkpoints', max_to_keep=1, agent=agent, policy=agent.policy, replay_buffer=agent.collect_data_spec)
+policy_checkpointer = common.Checkpointer(ckpt_dir='cartpole_policy', max_to_keep=1, policy=agent.policy)
+rb_checkpointer = common.Checkpointer(ckpt_dir='cartpole_rb', max_to_keep=1, replay_buffer=agent.collect_data_spec)
+
+Начнем обучение
+agent.train = common.function(agent.train)
+agent.train_step_counter.assign(0)
+
+Проверка начального состояния агента
+avg_return = compute_avg_return(environment, agent.policy, num_episodes=10)
+returns = [avg_return]
+print('Средний выигрыш на начальном состоянии: {}'.format(avg_return.numpy()))
+
+Заполним буфер воспроизведения
+initial_collect_driver = DynamicStepDriver(environment, agent.collect_policy, observers=[replay_buffer.add_batch], num_steps=initial_collect_steps)
+initial_collect_driver.run()
+
+Определим функцию для добавления в буфер на каждой итерации обучения
+def collect_step(environment, policy, buffer):
+time_step = environment.current_time_step()
+action_step = policy.action(time_step)
+next_time_step = environment.step(action_step.action)
+traj = trajectory.from_transition(time_step, action_step, next_time_step)
+# Добавим траекторию в буфер воспроизведения
+buffer.add_batch(traj)
+Начнем итерации обучения
+for i in range(num_iterations):
+# Добавим данные в буфер воспроизведения
+collect_step(environment, agent.collect_policy, replay_buffer)
+# Извлечем данные из буфера для обучения
+experience, unused_info = next(iterator)
+
+# Обновим веса агента
+train_loss = agent.train(experience).loss
+
+# Периодически сохраняем веса агента и политику
+if (i + 1) % 1000 == 0:
+    train_checkpointer.save(global_step=agent.train_step_counter)
+    policy_checkpointer.save(global_step=agent.train_step_counter)
+
+# П
+Создадим экземпляр агента
+agent = DQNAgent(num_actions=num_actions)
+
+Определим функцию потерь и оптимизатор
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
+
+Определим метрики для отслеживания процесса обучения
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+
+Определим функцию для одной итерации обучения
+@tf.function
+def train_step(environment, agent, optimizer, replay_buffer, huber_loss, batch_size):
+# Получим батч из буфера воспроизведения
+experience = replay_buffer.sample(batch_size)
+
+# Разобьем батч на отдельные массивы
+states, actions, rewards, next_states, dones = experience
+
+# Вычислим Q-значения для текущего состояния
+q_values = agent(states)
+
+# Получим Q-значения для следующего состояния
+next_q_values = agent(next_states)
+
+# Вычислим маску для не-завершенных эпизодов
+mask = tf.cast(tf.logical_not(dones), dtype=tf.float32)
+
+# Вычислим target Q-значения
+target_q_values = rewards + mask * agent.gamma * tf.reduce_max(next_q_values, axis=-1)
+
+# Вычислим Q-значения для выбранных действий
+action_masks = tf.one_hot(actions, agent.num_actions)
+chosen_action_q_values = tf.reduce_sum(tf.multiply(q_values, action_masks), axis=-1)
+
+# Вычислим функцию потерь
+with tf.GradientTape() as tape:
+    loss = huber_loss(target_q_values, chosen_action_q_values)
+
+# Вычислим градиенты
+gradients = tape.gradient(loss, agent.trainable_variables)
+
+# Применим градиенты к сети
+optimizer.apply_gradients(zip(gradients, agent.trainable_variables))
+
+# Обновим метрики
+train_loss(loss)
+train_accuracy(actions, q_values)
+
+Создадим окружение
+environment = gym.make('CartPole-v1')
+
+Создадим буфер воспроизведения
+replay_buffer = ReplayBuffer(replay_buffer_max_length)
+
+Наполним буфер начальными данными
+for i in range(initial_collect_steps):
+collect_step(environment, agent, replay_buffer)
+
+Запустим обучение
+for i in range(num_iterations):
+# Добавим данные в буфер воспроизведения
+for j in range(collect_steps_per_iteration):
+collect_step(environment, agent, replay_buffer)
+
+# Одна итерация обучения
+train_step(environment, agent, optimizer, replay_buffer, huber_loss, batch_size=64)
+
+# Выводим результаты каждую 100-ую итерацию
+if i % 100 == 0:
+    template = 'Iteration {}, Loss: {}, Accuracy: {}'
+    print(template.format(i, train_loss.result(), train
